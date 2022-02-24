@@ -181,6 +181,7 @@ def main(args):
                                         [0.2023, 0.1994, 0.2010])])
 
     transform_test = torchvision.transforms.Compose([
+        torchvision.transforms.CenterCrop(224),
         torchvision.transforms.ToTensor(),
         torchvision.transforms.Normalize([0.4914, 0.4822, 0.4465],
                                         [0.2023, 0.1994, 0.2010])])
@@ -191,15 +192,14 @@ def main(args):
     test_ds = torchvision.datasets.ImageFolder(args.data_dir + "/images/test", transform=transform_test)
 
     # dataloader
-    batch_size=256
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size,
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size,
         sampler=ImbalancedDatasetSampler(train_ds), drop_last=True, num_workers=0)
 
-    valid_loader = torch.utils.data.DataLoader(valid_ds, batch_size=batch_size, 
+    valid_loader = torch.utils.data.DataLoader(valid_ds, batch_size=args.batch_size, 
         sampler=ImbalancedDatasetSampler(valid_ds), drop_last=True, num_workers=0)
 
-    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, 
-        sampler=ImbalancedDatasetSampler(test_ds), drop_last=True, num_workers=0)
+    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=args.batch_size, 
+        sampler=ImbalancedDatasetSampler(test_ds), drop_last=False, num_workers=0)
 
 
     # model setting
