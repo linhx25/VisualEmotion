@@ -1,14 +1,17 @@
+#!/apps/anaconda3/bin/python
+import os
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
 import torchvision
-from typing import Callable
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple
 import copy
 import json
 import argparse
 from tqdm import tqdm
 from PIL import ImageFile
+from datetime import datetime
 from sklearn.metrics import confusion_matrix
 from torch.utils.tensorboard import SummaryWriter
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -23,7 +26,35 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     
+    
+# Personalized ImageFolder
+class ImageFolder(torchvision.datasets.ImageFolder):
+    def __init__(self, root: str,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        is_valid_file: Optional[Callable[[str], bool]] = None,
+    ):
+        super().__init__(root,
+        transform = transform,
+        target_transform = target_transform,
+        is_valid_file = is_valid_file,)
+        
+     # override find_classes
+    def find_classes(self, directory: str) -> Tuple[List[str], Dict[str, int]]:
+        """Finds the class folders in a dataset.
 
+        See :class:`DatasetFolder` for details.
+        """
+        classes = sorted(
+            entry.name for entry in os.scandir(directory) 
+            if entry.is_dir() and entry.name != 'love')
+        if not classes:
+            raise FileNotFoundError(f"Couldn't find any class folder in {directory}.")
+
+        class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
+        return classes, class_to_idx
+    
+    
 # Sampler
 class ImbalancedDatasetSampler(torch.utils.data.sampler.Sampler):
     """Samples elements randomly from a given list of indices for imbalanced dataset
@@ -33,7 +64,7 @@ class ImbalancedDatasetSampler(torch.utils.data.sampler.Sampler):
         callback_get_label: a callback-like function which takes two arguments - dataset and index
     """
 
-    def __init__(self, dataset, indices: list = None, num_samples: int = None, callback_get_label: Callable = None):
+    def __init__(self, dataset, indices=None, num_samples=None, callback_get_label=None):
         # if indices is not provided, all elements in the dataset will be considered
         self.indices = list(range(len(dataset))) if indices is None else indices
 
@@ -149,7 +180,7 @@ def inference(model, data_loader, args, prefix='Test'):
 
     model.eval()
 
-    preds = [] # Logits: [N * 7]
+    preds = [] # Logits: [N * out_feat]
     for feat, label in tqdm(data_loader, desc=prefix, total=len(data_loader)):
 
         feat, label = feat.to(device), label.to(device)
@@ -169,7 +200,10 @@ def inference(model, data_loader, args, prefix='Test'):
 
 def main(args):
 
-    set_seed()
+    set_seed(args.seed)
+    outdir = args.outdir+'/'+datetime.now().strftime("%m-%d_%H-%M-%S")
+    if not os.path.exists(outdir):
+        os.makedirs(outdir)
 
     # Transform
     transform_train = torchvision.transforms.Compose([
@@ -187,10 +221,12 @@ def main(args):
                                         [0.2023, 0.1994, 0.2010])])
 
     # dataset 
-    train_ds = torchvision.datasets.ImageFolder(args.data_dir + "/images/train", transform=transform_train)
-    valid_ds = torchvision.datasets.ImageFolder(args.data_dir + "/images/valid", transform=transform_train)
-    test_ds = torchvision.datasets.ImageFolder(args.data_dir + "/images/test", transform=transform_test)
-
+    imgF = ImageFolder if args.use_self_imgF else torchvision.datasets.ImageFolder
+    train_ds = imgF(args.data_dir + "/images/train", transform=transform_train)
+    valid_ds = imgF(args.data_dir + "/images/valid", transform=transform_train)
+    test_ds = imgF(args.data_dir + "/images/test", transform=transform_test)
+    args.out_feat = len(train_ds.class_to_idx)
+    
     # dataloader
     train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size,
         sampler=ImbalancedDatasetSampler(train_ds), drop_last=True, num_workers=0)
@@ -204,7 +240,7 @@ def main(args):
 
     # model setting
     model = torchvision.models.resnet18(pretrained=True)
-    model.fc = nn.Linear(model.fc.in_features, 7)
+    model.fc = nn.Linear(model.fc.in_features, args.out_feat)
     model.to(device)
     # model = nn.DataParallel(model, device_ids=devices).to(devices[0])
 
@@ -213,7 +249,7 @@ def main(args):
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.n_epochs//5, gamma=args.gamma)
 
     # loss
-    writer = SummaryWriter(log_dir="./log")
+    writer = SummaryWriter(log_dir=outdir)
     best_score = {}
     best_epoch = 0
     stop_round = 0
@@ -255,23 +291,23 @@ def main(args):
             stop_round = 0
             best_epoch = epoch    
             best_param = copy.deepcopy(model.state_dict())
-            torch.save(best_param, f'./model/model.bin')
+            torch.save(best_param, outdir+"/model.bin")
     
     
     print('best score:', best_score, '@', best_epoch)
     info = dict(
-        config={"early_stop":args.early_stop, "n_epochs": args.n_epochs},
+        config={vars(args)},
         best_epoch=best_epoch,
         best_score=best_score,
     )
-    with open('./model/info.json', 'w') as f:
+    with open(outdir+'/info.json', 'w') as f:
         json.dump(info, f, indent=4)
 
     # inference
-    model.load_state_dict(torch.load(args.init_state, map_location='cpu'))
+    model.load_state_dict(best_param)
     for name in ['train','valid','test']:
-        preds = inference(model, eval(name+"_loader"), None, name)
-        preds.to_pickle(args.outdir+name+"_pred.pkl")
+        preds = inference(model, eval(name+"_loader"), args, name)
+        preds.to_pickle(outdir+f"/{name}_pred.pkl")
     print('finished.')
     
 
@@ -281,13 +317,8 @@ def parse_args():
     parser = argparse.ArgumentParser(allow_abbrev=False)
 
     # model
-    parser.add_argument('--d_feat', type=int, default=32)
-    parser.add_argument('--hidden_size', type=int, default=256)
-    parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--dropout', type=float, default=0.5)
-    parser.add_argument('--input_drop', action='store_true')
-    parser.add_argument('--noise_level', type=float, default=0.0)
-    parser.add_argument('--init_state', default='./model/model.bin')
+    parser.add_argument('--out_feat', type=int, default=6)
+    parser.add_argument('--init_state', default='model.bin')
 
     # training
     parser.add_argument('--n_epochs', type=int, default=200)
@@ -301,12 +332,13 @@ def parse_args():
 
     # data
     parser.add_argument('--pin_memory', action='store_false')
-    parser.add_argument('--batch_size', type=int, default=256) # -1 indicate daily batch
+    parser.add_argument('--batch_size', type=int, default=256)
 
     # other
+    parser.add_argument('--use_self_imgF', action='store_true')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--data_dir', default='~/VisualEmotion/data')
-    parser.add_argument('--outdir', default='./')
+    parser.add_argument('--outdir', default='./output')
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--save_ckpts', action='store_true')
 
