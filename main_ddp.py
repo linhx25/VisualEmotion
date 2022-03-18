@@ -16,15 +16,18 @@ from sklearn.metrics import confusion_matrix
 from torch.utils.tensorboard import SummaryWriter
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-# devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
 
-
-
-def set_seed(seed=42):
+def set_seed(seed=42, cuda_deterministic=True):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    if cuda_deterministic:  # slower, more reproducible
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:  # faster, less reproducible
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
     
 def _freeze_modules(epoch, model, args):
@@ -46,7 +49,7 @@ def _freeze_modules(epoch, model, args):
         print('..unfreeze modules:')
         grad = True
 
-    for name, module in model.named_children():
+    for name, module in model.module.named_children():
         if (freeze and name in modules) or \
            (not freeze and name not in modules):
             print(name, end=', ')
@@ -173,13 +176,15 @@ global_step = -1
 def train_epoch(epoch, model, optimizer, scheduler, data_loader, writer, args):
 
     global global_step
+    data_loader.sampler.set_epoch(epoch)
     loss_fn = nn.CrossEntropyLoss()
+
     _freeze_modules(epoch, model, args)
     model.train()
 
     for feat, label in tqdm(data_loader, total=len(data_loader)):
         
-        feat, label = feat.to(device), label.to(device)
+        feat, label = feat.to(args.device), label.to(args.device)
 
         global_step += 1
         optimizer.zero_grad()
@@ -215,7 +220,7 @@ def test_epoch(epoch, model, data_loader, writer, args, prefix='Test'):
     for feat, label in tqdm(data_loader, desc=prefix, total=len(data_loader)):
 
         with torch.no_grad():
-            feat, label = feat.to(device), label.to(device)
+            feat, label = feat.to(args.device), label.to(args.device)
             pred = model(feat)
             loss = loss_fn(pred, label)
             score = (pred.argmax(dim=1)==label).to(feat).mean()
@@ -242,7 +247,7 @@ def inference(model, data_loader, args, prefix='Test'):
     preds = [] # Logits: [N * out_feat]
     for feat, label in tqdm(data_loader, desc=prefix, total=len(data_loader)):
 
-        feat, label = feat.to(device), label.to(device)
+        feat, label = feat.to(args.device), label.to(args.device)
 
         with torch.no_grad():
             pred = model(feat)
@@ -258,10 +263,13 @@ def inference(model, data_loader, args, prefix='Test'):
 
 
 def main(args):
+    
+    torch.cuda.set_device(args.local_rank)
+    torch.distributed.init_process_group(backend='nccl')
+    set_seed(args.seed + args.local_rank)
 
-    set_seed(args.seed)
     outdir = args.outdir+'/'+datetime.now().strftime("%m-%d_%H-%M-%S")
-    if not os.path.exists(outdir):
+    if not os.path.exists(outdir) and torch.distributed.get_rank()==0:
         os.makedirs(outdir)
 
     # Transform
@@ -288,8 +296,9 @@ def main(args):
     args.out_feat = len(train_ds.class_to_idx)
     
     # dataloader
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size,
-        shuffle=True, drop_last=True, num_workers=args.n_workers)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size, 
+                                                sampler=torch.utils.data.distributed.DistributedSampler(train_ds),
+                                                pin_memory=True, drop_last=True)
 
     valid_loader = torch.utils.data.DataLoader(valid_ds, batch_size=args.batch_size, 
         shuffle=True, drop_last=True, num_workers=args.n_workers)
@@ -305,25 +314,18 @@ def main(args):
         print('load model init state')
         res = load_state_dict_unsafe(model, torch.load(args.init_state, map_location='cpu'))
         print(res)
-    model.to(device)
+    model.to(args.device)
+    model = nn.parallel.DistributedDataParallel(
+        model, find_unused_parameters=True, 
+        device_ids=[args.local_rank], output_device=args.local_rank)
 
     # optimizer
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.wd)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.n_epochs//5, gamma=args.gamma)
-
-    # loss
-    writer = SummaryWriter(log_dir=outdir)
-    best_score = {}
-    best_epoch = 0
-    stop_round = 0
-    best_param = copy.deepcopy(model.state_dict())
+    writer = SummaryWriter(log_dir=outdir) if torch.distributed.get_rank()==0 else None
 
     # training
     for epoch in range(args.n_epochs):
-        stop_round += 1
-        if stop_round > args.early_stop and args.early_stop >= 0:
-            print('early stop')
-            break
 
         print('Epoch:', epoch)
 
@@ -344,35 +346,21 @@ def main(args):
         print('Metric (%s): train %.6f, valid %.6f, test %.6f'%(
             "Accuracy", 0, valid_score.mean(), test_score.mean()))
 
-
-        best_valid_score = best_score.get('valid_'+ args.metric, -1)
-        if valid_score.mean() > best_valid_score or (args.early_stop < 0 and epoch % 4 == 0):
-            print('\tvalid metric (%s) updates from %.6f to %.6f'%(
-                args.metric, best_valid_score, valid_score.mean()))                
-            for name in ['valid', 'test']:
-                best_score[name+'_loss'] = eval(name+'_loss').mean()
-                best_score[name+'_'+args.metric] = eval(name+'_score').mean()
-            stop_round = 0
-            best_epoch = epoch    
-            best_param = copy.deepcopy(model.state_dict())
-            torch.save(best_param, outdir+"/model.bin")
+        if epoch % 4 == 0 and torch.distributed.get_rank() == 0:
+            torch.save(model.module.state_dict(), outdir+"/model.bin")
     
-    
-    print('best score:', best_score, '@', best_epoch)
-    info = dict(
-        config=vars(args),
-        best_epoch=best_epoch,
-        best_score=best_score,
-    )
-    with open(outdir+'/info.json', 'w') as f:
-        json.dump(info, f, indent=4)
+    if torch.distributed.get_rank() == 0:
+        info = dict(
+            config=vars(args),
+        )
+        with open(outdir+'/info.json', 'w') as f:
+            json.dump(info, f, indent=4)
 
-    # inference
-    model.load_state_dict(best_param)
-    for name in ['train','valid','test']:
-        preds = inference(model, eval(name+"_loader"), args, name)
-        preds.to_pickle(outdir+f"/{name}_pred.pkl")
-    print('finished.')
+        # inference
+        for name in ['train','valid','test']:
+            preds = inference(model, eval(name+"_loader"), args, name)
+            preds.to_pickle(outdir+f"/{name}_pred.pkl")
+        print('finished.')
     
 
 
@@ -393,7 +381,7 @@ def parse_args():
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--gamma', type=float, default=0.99)    
     parser.add_argument('--wd', type=float, default=1e-4)
-    parser.add_argument('--early_stop', type=int, default=30) # -1: no early stop
+    parser.add_argument('--early_stop', type=int, default=-1) # -1: no early stop
     parser.add_argument('--loss', default='CE')
     parser.add_argument('--metric', default='acc')
 
@@ -409,9 +397,11 @@ def parse_args():
     parser.add_argument('--outdir', default='./output')
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--save_ckpts', action='store_true')
+    parser.add_argument('--local_rank', type=int, default=int(os.environ['LOCAL_RANK']))
 
     args = parser.parse_args()
-
+    args.device = torch.device("cuda", args.local_rank)
+    
     return args
 
 
