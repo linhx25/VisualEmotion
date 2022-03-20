@@ -20,4 +20,10 @@ unzip Emotion-6.zip -d ./data && rm Emotion-6.zip
 
 unzip ./data/UnBiasedEmo/images.zip -d ./data/UnBiasedEmo/ && rm ./data/UnBiasedEmo/images.zip
 
-unzip ./data/Emotion-6/images.zip -d ./data/Emotion-6/ && rm ./data/Emotion-6/images.zip
+unzip ./data/Emotion-6/images.zip -d ./data/Emotion-6/ && rm ./data/Emotion-6/images.zip && rm ./data/Emotion-6/images/anger/rage/rage/287.jpg
+
+# kaggle
+pip install kaggle --upgrade # update kaggle config json
+kaggle competitions download -c challenges-in-representation-learning-facial-expression-recognition-challenge && mkdir ./kaggle && cd ./kaggle && unzip ../challenges-in-representation-learning-facial-expression-recognition-challenge.zip && rm ../challenges-in-representation-learning-facial-expression-recognition-challenge.zip && tar -xf fer2013.tar.gz
+
+
