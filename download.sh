@@ -27,3 +27,4 @@ pip install kaggle --upgrade # update kaggle config json
 kaggle competitions download -c challenges-in-representation-learning-facial-expression-recognition-challenge && mkdir ./kaggle && cd ./kaggle && unzip ../challenges-in-representation-learning-facial-expression-recognition-challenge.zip && rm ../challenges-in-representation-learning-facial-expression-recognition-challenge.zip && tar -xf fer2013.tar.gz
 
 
+# anapy3 --grid_ncpus=8 --grid_submit=batch --grid_mem=20G --grid_gpu -u -m torch.distributed.launch --nproc_per_node=4 main_ddp.py --use_self_imgF --model resnet50 --freeze_modules "~fc,avgpool,layer3,layer4"  --freeze_first_n_epochs 60 --data_dir  ~/VisualEmotion/data/images_bk --lr 0.01 --n_epochs 60 --n_workers 0 --batch_size 64 --milestones 16 32 48 --sampler imbalance --comments "6_classes_exclude_love"
