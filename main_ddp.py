@@ -290,20 +290,15 @@ def inference(model, data_loader, args, prefix="Test"):
         with torch.no_grad():
             pred = model(feat)
 
-        preds.append(
-            pd.concat(
-                [
-                    pd.DataFrame(
-                        pred.cpu().numpy(),
-                        columns=[c for c in data_loader.dataset.classes],
-                    ),
-                    pd.DataFrame(
-                        {"label": label.cpu().numpy()}, index=np.arange(len(label))
-                    ),
-                ],
-                axis=1,
-            )
-        )
+        preds.append(pd.concat([
+            pd.DataFrame(
+                pred.cpu().numpy(),
+                columns=[c for c in data_loader.dataset.classes],
+            ),
+            pd.DataFrame(
+                {"label": label.cpu().numpy()}, index=np.arange(len(label))
+            ),], axis=1,
+        ))
 
     preds = pd.concat(preds, axis=0)
 
@@ -316,7 +311,7 @@ def main(args):
     torch.distributed.init_process_group(backend="nccl")
     set_seed(args.seed + args.local_rank)
 
-    outdir = args.outdir + "/" + datetime.now().strftime("%m-%d_%H-%M-%S")
+    outdir = args.outdir + "/" + datetime.now().strftime("%m-%d_%H:%M:%S")
     if not os.path.exists(outdir) and args.local_rank == 0:
         os.makedirs(outdir)
 
@@ -443,17 +438,18 @@ def main(args):
         if epoch % 4 == 0 and args.local_rank == 0:
             torch.save(model.module.state_dict(), outdir + "/model.bin")
 
-    if args.local_rank == 0:
 
-        # inference
-        scores = {}
-        names = ["train", "valid", "test"] if args.validate else ["train", "test"]
-        for name in names:
-            preds = inference(model, eval(name + "_loader"), args, name)
+    # inference
+    scores = {}
+    names = ["train", "valid", "test"] if args.validate else ["train", "test"]
+    for name in names:
+        preds = inference(model, eval(name + "_loader"), args, name)
+        if args.local_rank == 0:
             preds.to_pickle(outdir + f"/{name}_pred.pkl")
-            pred = np.argmax(preds.values[:, :-1], axis=1)
-            scores[name + "_acc"] = (pred == preds["label"]).astype(float).mean()
+        pred = np.argmax(preds.values[:, :-1], axis=1)
+        scores[name + "_acc"] = (pred == preds["label"]).astype(float).mean()
 
+    if args.local_rank == 0:
         args.device = "cuda:0"
         info = dict(
             config=vars(args),
